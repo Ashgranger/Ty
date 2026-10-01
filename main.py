@@ -1,74 +1,80 @@
+#!/usr/bin/env python3
+"""Arcus perp market maker (second bot + Level 4-7 quantitative features).
+
+  python main.py                 # paper-trade (DRY_RUN=1): real market data, simulated fills, no orders
+  python main.py --live          # send real post-only limit orders
+  python main.py scan            # rank markets by spread vs movement (pick where to quote)
 """
-Delta-neutral funding farming bot — paper trading mode.
-
-Usage:
-    python main.py --once        # run a single scan/mark/trade cycle and exit
-    python main.py                # loop forever at POLL_INTERVAL_SECONDS
-    python main.py --scan-only    # just print the funding scan, no paper trades
-
-State (open positions, realized PnL) persists to portfolio_state.json
-between runs, so stopping and restarting the bot doesn't lose history.
-"""
-
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
-import time
+import os
+import signal
+import sys
 
-from config import LOG_FILE, POLL_INTERVAL_SECONDS, STATE_FILE
-from engine import run_cycle
-from portfolio import Portfolio
-from scanner import poll_all, rank_opportunities
+from utils import Fatal, setup_logging
 
-
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE)],
-    )
-
-
-def print_scan() -> None:
-    by_symbol = poll_all()
-    opps = rank_opportunities(by_symbol)
-    print(f"\n{'SYMBOL':<6} {'SHORT VENUE':<14} {'SHORT APR':>10} {'LONG VENUE':<14} {'LONG APR':>10} {'SPREAD':>10}")
-    print("-" * 70)
-    for o in opps:
-        print(f"{o.symbol:<6} {o.short_venue:<14} {o.short_apr_pct:>9.1f}% {o.long_venue:<14} "
-              f"{o.long_apr_pct:>9.1f}% {o.spread_apr_pct:>9.1f}%")
-    if not opps:
-        print("(no data — check network access / venue adapters)")
+log = logging.getLogger("main")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
-    parser.add_argument("--scan-only", action="store_true", help="print funding scan only, no trading")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Arcus perp market maker")
+    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "scan"])
+    ap.add_argument("--live", action="store_true", help="send real orders (overrides DRY_RUN=1)")
+    ap.add_argument("--env", choices=["mainnet", "testnet"], help="override ARCUS_ENV")
+    ap.add_argument("--market", help="override MARKET")
+    ap.add_argument("--env-file", default=".env")
+    ap.add_argument("--seconds", type=float, default=30, help="scan sampling time")
+    args = ap.parse_args()
 
-    setup_logging()
-    log = logging.getLogger("main")
-
-    if args.scan_only:
-        print_scan()
-        return
-
-    pf = Portfolio.load(STATE_FILE)
-    log.info("loaded portfolio: equity=$%.2f, %d open position(s)", pf.equity_usd, len(pf.open_positions()))
-
-    if args.once:
-        run_cycle(pf)
-        return
-
-    log.info("starting continuous loop, polling every %ds (Ctrl+C to stop)", POLL_INTERVAL_SECONDS)
     try:
-        while True:
-            run_cycle(pf)
-            time.sleep(POLL_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        log.info("stopped by user, final state saved to %s", STATE_FILE)
+        from dotenv import load_dotenv
+        load_dotenv(args.env_file)
+    except ImportError:
+        pass
+    if args.env:
+        os.environ["ARCUS_ENV"] = args.env
+    if args.market:
+        os.environ["MARKET"] = args.market
+    if args.live:
+        os.environ["DRY_RUN"] = "0"
+
+    setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+    from config import Config
+    try:
+        cfg = Config.from_env()
+    except Fatal as e:
+        sys.exit(f"config error: {e}")
+
+    if args.cmd == "scan":
+        from scan import scan
+        asyncio.run(scan(cfg, args.seconds))
+        return
+
+    from bot import MarketMaker
+    log.info("env=%s market=%s %s | order=$%s max_pos=$%s min_edge=%sbps skew=%sbps exit_profit=%sbps "
+             "stress=%sbps max_loss=$%s | L7: ev=%s(min %sbps) intel=%s learning=%s levels=%d",
+             cfg.env_name, cfg.market,
+             "PAPER (no orders sent)" if cfg.dry_run else "LIVE", cfg.order_usd, cfg.max_position_usd,
+             cfg.min_edge_bps, cfg.skew_bps, cfg.exit_min_profit_bps, cfg.stress_loss_bps,
+             cfg.session_max_loss_usd, cfg.enable_adaptive_ev, cfg.min_ev_bps, cfg.enable_orderbook_intel,
+             cfg.enable_online_learning, cfg.extra_levels)
+    if not cfg.dry_run and cfg.env_name == "mainnet":
+        log.warning("LIVE ON MAINNET - real funds. Only post-only limit orders. Ctrl+C cancels all and exits.")
+
+    async def _main() -> None:
+        bot = MarketMaker(cfg)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, bot.stop_evt.set)
+            except NotImplementedError:  # Windows
+                signal.signal(sig, lambda *_: loop.call_soon_threadsafe(bot.stop_evt.set))
+        await bot.run()
+
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":
